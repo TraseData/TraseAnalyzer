@@ -1,0 +1,31 @@
+name: Trase Analyzer
+
+on:
+  schedule:
+    # 07:10 UTC ≈ 10:10 Asia/Riyadh (after your 09:35 export)
+    - cron: "10 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      # Pass secrets & variables to the script
+      - name: Run analyzer
+        env:
+          MODE: ${{ vars.MODE }}             # set to sheet_only or funnel_webhook
+          SHEETS_CSV_URLS: ${{ secrets.SHEETS_CSV_URLS }}
+          FUNNEL_WEBHOOK_ENDPOINT: ${{ secrets.FUNNEL_WEBHOOK_ENDPOINT }}
+          FUNNEL_WEBHOOK_TOKEN: ${{ secrets.FUNNEL_WEBHOOK_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_PREFIX: ${{ vars.S3_PREFIX }}
+        run: python analyzer.py
