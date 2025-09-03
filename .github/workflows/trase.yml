@@ -5,13 +5,20 @@ on:
     - cron: "10 7 * * *"   # 07:10 UTC = 10:10 Riyadh
   workflow_dispatch:
 
+concurrency:
+  group: trase-analyzer
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -19,23 +26,28 @@ jobs:
         run: ls -R
 
       - name: Install deps
-        working-directory: ./trase_bot
         run: pip install -r requirements.txt
 
       - name: Preflight – validate env & files
-        working-directory: ./trase_bot
         env:
           FUNNEL_EXPORT_URL: ${{ secrets.FUNNEL_EXPORT_URL }}
           FUNNEL_WEBHOOK_URL: ${{ secrets.FUNNEL_WEBHOOK_URL }}
           FUNNEL_WEBHOOK_TOKEN: ${{ secrets.FUNNEL_WEBHOOK_TOKEN }}
         run: |
           set -e
-          [ -z "$FUNNEL_EXPORT_URL" ] && echo "❌ FUNNEL_EXPORT_URL missing" && exit 1 || echo "✅ FUNNEL_EXPORT_URL"
-          [ -z "$FUNNEL_WEBHOOK_URL" ] && echo "❌ FUNNEL_WEBHOOK_URL missing" && exit 1 || echo "✅ FUNNEL_WEBHOOK_URL"
-          [ -f config/media_plan.csv ] && echo "✅ media_plan.csv" || (echo "⚠️ creating sample"; mkdir -p config; printf "client,brand,market,platform,campaign,objective,total_budget,duration_days,daily_cap,target_CPC,target_CPL,target_CPM,target_CPV\nClient A,Brand X,KSA,Meta,Campaign 1,Conversions,10000,30,400,2.00,10.00,8.00,0.05\nClient B,Brand Y,KSA,Meta,Campaign 2,Awareness,8000,30,300,2.50,12.00,9.00,0.06\n" > config/media_plan.csv)
+          echo "Checking required ENV…"
+          [ -z "$FUNNEL_EXPORT_URL" ] && echo "❌ FUNNEL_EXPORT_URL missing" && exit 1 || echo "✅ FUNNEL_EXPORT_URL present"
+          [ -z "$FUNNEL_WEBHOOK_URL" ] && echo "❌ FUNNEL_WEBHOOK_URL missing" && exit 1 || echo "✅ FUNNEL_WEBHOOK_URL present"
+          echo "Checking repo files…"
+          if [ -f config/media_plan.csv ]; then
+            echo "✅ config/media_plan.csv found"
+          else
+            echo "⚠️ media_plan.csv missing – creating sample"
+            mkdir -p config
+            printf "client,brand,market,platform,campaign,objective,total_budget,duration_days,daily_cap,target_CPC,target_CPL,target_CPM,target_CPV\nClient A,Brand X,KSA,Meta,Campaign 1,Conversions,10000,30,400,2.00,10.00,8.00,0.05\nClient B,Brand Y,KSA,Meta,Campaign 2,Awareness,8000,30,300,2.50,12.00,9.00,0.06\n" > config/media_plan.csv
+          fi
 
       - name: Run analyzer
-        working-directory: ./trase_bot
         env:
           FUNNEL_EXPORT_URL: ${{ secrets.FUNNEL_EXPORT_URL }}
           FUNNEL_WEBHOOK_URL: ${{ secrets.FUNNEL_WEBHOOK_URL }}
@@ -44,8 +56,11 @@ jobs:
           WEEK_OVER_WEEK_THRESHOLD_PCT: "15"
           RATE_VARIANCE_BAND_PCT: "15"
           NOT_SPENDING_THRESHOLD_PCT: "20"
+          # Optional: override if your plan is elsewhere
+          MEDIA_PLAN_PATH: "config/media_plan.csv"
         run: |
           set -euxo pipefail
+          python -V
           python trase_analyzer.py | tee run.log
 
       - name: Upload outputs & logs
@@ -54,6 +69,6 @@ jobs:
         with:
           name: trase-outputs
           path: |
-            trase_bot/out/*.csv
-            trase_bot/run.log
+            out/*.csv
+            run.log
           if-no-files-found: warn
