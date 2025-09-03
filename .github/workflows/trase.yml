@@ -2,29 +2,47 @@ name: Trase Bot Analyzer (Daily 10:10 KSA)
 
 on:
   schedule:
-    - cron: "10 7 * * *"   # 07:10 UTC = 10:10 Riyadh
+    - cron: "10 7 * * *"   # 07:10 UTC = 10:10 Asia/Riyadh
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Pass secrets & variables to the script
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Configure ENV
+        env:
+          FUNNEL_EXPORT_URL: ${{ secrets.FUNNEL_EXPORT_URL }}
+          FUNNEL_WEBHOOK_URL: ${{ secrets.FUNNEL_WEBHOOK_URL }}
+          FUNNEL_WEBHOOK_TOKEN: ${{ secrets.FUNNEL_WEBHOOK_TOKEN }}
+          EMAIL_ENABLED: "false"
+          WEEK_OVER_WEEK_THRESHOLD_PCT: "15"
+          RATE_VARIANCE_BAND_PCT: "15"
+          NOT_SPENDING_THRESHOLD_PCT: "20"
+        run: |
+          echo "ENV ready"
+
       - name: Run analyzer
         env:
-          MODE: ${{ vars.MODE }}             # set to sheet_only or funnel_webhook
-          SHEETS_CSV_URLS: ${{ secrets.SHEETS_CSV_URLS }}
-          FUNNEL_WEBHOOK_ENDPOINT: ${{ secrets.FUNNEL_WEBHOOK_ENDPOINT }}
+          FUNNEL_EXPORT_URL: ${{ secrets.FUNNEL_EXPORT_URL }}
+          FUNNEL_WEBHOOK_URL: ${{ secrets.FUNNEL_WEBHOOK_URL }}
           FUNNEL_WEBHOOK_TOKEN: ${{ secrets.FUNNEL_WEBHOOK_TOKEN }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          S3_BUCKET: ${{ vars.S3_BUCKET }}
-          S3_PREFIX: ${{ vars.S3_PREFIX }}
-        run: python analyzer.py
+        run: |
+          python trase_analyzer.py
+
+      - name: Upload artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: out/*.csv
