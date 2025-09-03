@@ -12,7 +12,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,28 +21,60 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Show repo tree (debug)
-        run: ls -R
+      - name: Locate analyzer script
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          echo "Repository tree:"
+          ls -R
+
+          # Try common names/paths (root or any subdir)
+          SCRIPT="$(git ls-files | grep -E '(^|/)trase_analyzer\.py$' | head -n1 || true)"
+          if [ -z "$SCRIPT" ]; then
+            SCRIPT="$(git ls-files | grep -E '(^|/)analyzer\.py$' | head -n1 || true)"
+          fi
+
+          if [ -z "$SCRIPT" ]; then
+            echo "❌ Could not find trase_analyzer.py or analyzer.py in the repo."
+            exit 1
+          fi
+
+          DIR="$(dirname "$SCRIPT")"
+          echo "✅ Found script: $SCRIPT"
+          echo "script=$SCRIPT" >> "$GITHUB_OUTPUT"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        shell: bash
+        run: |
+          set -e
+          if [ -f "${{ steps.locate.outputs.dir }}/requirements.txt" ]; then
+            pip install -r "${{ steps.locate.outputs.dir }}/requirements.txt"
+          elif [ -f "requirements.txt" ]; then
+            pip install -r "requirements.txt"
+          else
+            echo "⚠️ requirements.txt not found; proceeding (may already be installed)"
+          fi
 
       - name: Preflight – validate env & files
         env:
           FUNNEL_EXPORT_URL: ${{ secrets.FUNNEL_EXPORT_URL }}
           FUNNEL_WEBHOOK_URL: ${{ secrets.FUNNEL_WEBHOOK_URL }}
           FUNNEL_WEBHOOK_TOKEN: ${{ secrets.FUNNEL_WEBHOOK_TOKEN }}
+        shell: bash
         run: |
           set -e
-          echo "Checking required ENV…"
           [ -z "$FUNNEL_EXPORT_URL" ] && echo "❌ FUNNEL_EXPORT_URL missing" && exit 1 || echo "✅ FUNNEL_EXPORT_URL present"
           [ -z "$FUNNEL_WEBHOOK_URL" ] && echo "❌ FUNNEL_WEBHOOK_URL missing" && exit 1 || echo "✅ FUNNEL_WEBHOOK_URL present"
-          echo "Checking repo files…"
+
+          # Ensure a media_plan.csv exists next to the script (in its config/ folder)
+          cd "${{ steps.locate.outputs.dir }}"
+          mkdir -p config
           if [ -f config/media_plan.csv ]; then
             echo "✅ config/media_plan.csv found"
           else
             echo "⚠️ media_plan.csv missing – creating sample"
-            mkdir -p config
             printf "client,brand,market,platform,campaign,objective,total_budget,duration_days,daily_cap,target_CPC,target_CPL,target_CPM,target_CPV\nClient A,Brand X,KSA,Meta,Campaign 1,Conversions,10000,30,400,2.00,10.00,8.00,0.05\nClient B,Brand Y,KSA,Meta,Campaign 2,Awareness,8000,30,300,2.50,12.00,9.00,0.06\n" > config/media_plan.csv
           fi
 
@@ -56,12 +87,12 @@ jobs:
           WEEK_OVER_WEEK_THRESHOLD_PCT: "15"
           RATE_VARIANCE_BAND_PCT: "15"
           NOT_SPENDING_THRESHOLD_PCT: "20"
-          # Optional: override if your plan is elsewhere
           MEDIA_PLAN_PATH: "config/media_plan.csv"
+        shell: bash
         run: |
           set -euxo pipefail
           python -V
-          python trase_analyzer.py | tee run.log
+          python "${{ steps.locate.outputs.script }}" | tee "${{ steps.locate.outputs.dir }}/run.log"
 
       - name: Upload outputs & logs
         if: always()
@@ -69,6 +100,6 @@ jobs:
         with:
           name: trase-outputs
           path: |
-            out/*.csv
-            run.log
+            ${{ steps.locate.outputs.dir }}/out/*.csv
+            ${{ steps.locate.outputs.dir }}/run.log
           if-no-files-found: warn
