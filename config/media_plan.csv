@@ -1,0 +1,3 @@
+client,brand,market,platform,campaign,objective,total_budget,duration_days,daily_cap,target_CPC,target_CPL,target_CPM,target_CPV
+Client A,Brand X,KSA,Meta,Campaign 1,Conversions,10000,30,400,2.00,10.00,8.00,0.05
+Client B,Brand Y,KSA,Meta,Campaign 2,Awareness,8000,30,300,2.50,12.00,9.00,0.06

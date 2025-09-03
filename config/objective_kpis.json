@@ -1,0 +1,29 @@
+{
+  "Awareness": [
+    "impressions",
+    "reach",
+    "CPM"
+  ],
+  "Video Views": [
+    "video_views",
+    "CPV"
+  ],
+  "Consideration": [
+    "clicks",
+    "CTR",
+    "CPC",
+    "engagement_rate"
+  ],
+  "Conversions": [
+    "conversions",
+    "CPA",
+    "ROAS"
+  ],
+  "Default": [
+    "spend",
+    "impressions",
+    "clicks",
+    "CTR",
+    "CPC"
+  ]
+}
