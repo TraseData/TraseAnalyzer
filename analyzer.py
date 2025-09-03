@@ -1,184 +1,323 @@
-import os, io, time, json
-from datetime import datetime
-import pandas as pd
+import os
+import io
+import json
+import math
+import smtplib
 import requests
+import numpy as np
+import pandas as pd
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-# Optional (only if you want to auto-upload to S3 and ping Funnel)
-USE_S3 = os.getenv("MODE", "sheet_only") == "funnel_webhook"
-if USE_S3:
-    import boto3
-    from botocore.config import Config
+# ----------------------
+# Config & Helpers
+# ----------------------
+load_dotenv()
 
-# ---------- Helpers ----------
-def fetch_csv(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    return pd.read_csv(io.StringIO(r.text))
+FUNNEL_EXPORT_URL   = os.getenv("FUNNEL_EXPORT_URL", "")
+FUNNEL_WEBHOOK_URL  = os.getenv("FUNNEL_WEBHOOK_URL", "")
+FUNNEL_WEBHOOK_TOKEN= os.getenv("FUNNEL_WEBHOOK_TOKEN", "")
 
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = {c.lower(): c for c in df.columns}
+EMAIL_ENABLED       = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
+EMAIL_SMTP_HOST     = os.getenv("EMAIL_SMTP_HOST", "")
+EMAIL_SMTP_PORT     = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+EMAIL_SMTP_USER     = os.getenv("EMAIL_SMTP_USER", "")
+EMAIL_SMTP_PASS     = os.getenv("EMAIL_SMTP_PASS", "")
+EMAIL_FROM          = os.getenv("EMAIL_FROM", "Insights Bot <bot@example.com>")
+EMAIL_TO            = os.getenv("EMAIL_TO", "")
+EMAIL_SUBJECT_TEMPLATE = os.getenv("EMAIL_SUBJECT_TEMPLATE",
+                                  "[{client}] Weekly Funnel Insights — KPIs & Actions")
 
-    if "date" not in cols:
-        raise ValueError("CSV must contain a 'date' column.")
+WEEK_OVER_WEEK_THRESHOLD_PCT = float(os.getenv("WEEK_OVER_WEEK_THRESHOLD_PCT", "15"))
+RATE_VARIANCE_BAND_PCT       = float(os.getenv("RATE_VARIANCE_BAND_PCT", "15"))
+NOT_SPENDING_THRESHOLD_PCT   = float(os.getenv("NOT_SPENDING_THRESHOLD_PCT", "20"))
 
-    df["date"] = pd.to_datetime(df[cols["date"]], errors="coerce").dt.date
+OBJECTIVE_KPIS_PATH = "config/objective_kpis.json"
+MEDIA_PLAN_PATH     = os.getenv("MEDIA_PLAN_PATH", "config/media_plan.csv")
+RELEVANT_OBJECTIVE_COL = "objective"
 
-    def num(col, default=0.0):
-        if col in cols:
-            return pd.to_numeric(df[cols[col]], errors="coerce").fillna(0.0)
-        return pd.Series([default] * len(df))
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
 
-    df["spend"] = num("spend", 0.0)
-    df["conversions"] = num("conversions", 0.0)
-    df["revenue"] = num("revenue", 0.0)
+def _pct_change(new, old):
+    if pd.isna(old) or old == 0:
+        return np.nan
+    return 100.0 * (new - old) / old
 
-    # entity (campaign/adset/etc.)
-    entity = None
-    for k in ["campaign", "campaign name", "campaign_name", "campaign id", "campaign_id", "account", "source"]:
-        if k in cols:
-            entity = cols[k]
-            break
-    if entity is None:
-        df["entity"] = "ALL"
-    else:
-        df = df.rename(columns={entity: "entity"})
+def _safe_div(a, b):
+    a = _to_float(a)
+    b = _to_float(b)
+    if pd.isna(a) or pd.isna(b) or b == 0:
+        return np.nan
+    return a / b
 
-    df["cpa"] = df.apply(lambda r: (r["spend"] / r["conversions"]) if r["conversions"] else None, axis=1)
-    df["roas"] = df.apply(lambda r: (r["revenue"] / r["spend"]) if r["spend"] else None, axis=1)
+# ----------------------
+# Ingest
+# ----------------------
+def fetch_funnel_csv(url: str) -> pd.DataFrame:
+    if not url:
+        raise ValueError("FUNNEL_EXPORT_URL is empty. Set it in .env/secrets.")
+    url = str(url)
+    if url.lower().startswith(("http://", "https://")):
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        return pd.read_csv(io.StringIO(r.text))
+    # local path
+    return pd.read_csv(url)
+
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    for col in ["date","client","brand","market","platform","campaign","objective",
+                "spend","impressions","clicks","conversions","revenue","reach","video_views"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    numeric_cols = ["spend","impressions","clicks","conversions","revenue","reach","video_views"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     return df
 
-def wow_delta(curr, prev):
-    if prev in (None, 0) or pd.isna(prev):
-        return None
-    return (curr - prev) / prev * 100.0
+# ----------------------
+# KPIs
+# ----------------------
+def compute_universal_kpis(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["CTR"] = df.apply(lambda r: _safe_div(r["clicks"], r["impressions"]), axis=1)
+    df["CPC"] = df.apply(lambda r: _safe_div(r["spend"], r["clicks"]), axis=1)
+    df["CPA"] = df.apply(lambda r: _safe_div(r["spend"], r["conversions"]), axis=1)
+    df["CPM"] = df.apply(lambda r: _safe_div(r["spend"], r["impressions"]) * 1000.0, axis=1)
+    df["ROAS"] = df.apply(lambda r: _safe_div(r["revenue"], r["spend"]), axis=1)
+    df["CPV"] = df.apply(lambda r: _safe_div(r["spend"], r["video_views"]), axis=1)
+    df["engagement_rate"] = (df["clicks"] / df["impressions"]).replace([np.inf, -np.inf], np.nan)
+    return df
 
-def build_insights(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
-    g = df.groupby(["date", "entity"], dropna=False).agg(
-        spend=("spend", "sum"),
-        conversions=("conversions", "sum"),
-        revenue=("revenue", "sum"),
-    ).reset_index()
-    g["cpa"] = g.apply(lambda r: (r["spend"]/r["conversions"]) if r["conversions"] else None, axis=1)
-    g["roas"] = g.apply(lambda r: (r["revenue"]/r["spend"]) if r["spend"] else None, axis=1)
-    g["week"] = pd.to_datetime(g["date"]).dt.to_period("W").apply(lambda r: r.start_time.date())
+def load_objective_map(path: str) -> dict:
+    with open(path, "r") as f:
+        return json.load(f)
 
-    w = g.groupby(["week", "entity"], dropna=False).agg(
-        spend=("spend", "sum"),
-        conversions=("conversions", "sum"),
-        revenue=("revenue", "sum"),
-    ).reset_index()
-    w["cpa"] = w.apply(lambda r: (r["spend"]/r["conversions"]) if r["conversions"] else None, axis=1)
-    w["roas"] = w.apply(lambda r: (r["revenue"]/r["spend"]) if r["spend"] else None, axis=1)
+# ----------------------
+# Weekly Aggregate & WoW
+# ----------------------
+def weekly_wow(df: pd.DataFrame) -> pd.DataFrame:
+    dfx = df.copy()
+    dfx["week"] = pd.to_datetime(dfx["date"]).to_period("W").apply(lambda p: p.start_time.date())
+    group_cols = ["client","brand","market","platform","campaign","objective","week"]
+    agg_cols = ["spend","impressions","clicks","conversions","revenue","reach","video_views",
+                "CTR","CPC","CPA","CPM","ROAS","CPV","engagement_rate"]
+    dfx = dfx.groupby(group_cols, dropna=False)[agg_cols].mean().reset_index()
+    dfx = dfx.sort_values(group_cols)
 
-    today = datetime.utcnow().date().isoformat()
-    weeks = sorted(w["week"].unique())
-    if len(weeks) < 2:
-        return pd.DataFrame([{
-            "date": today, "source": source_name, "scope": "Account", "entity": "ALL",
-            "kpi": "INFO", "value": "", "delta_wow": "",
-            "insight": "Not enough history for WoW comparison.",
-            "recommendation": "Let export run for another week.",
-            "priority": "Low", "confidence": 0.9
-        }])
+    # WoW % changes
+    keys = ["client","brand","market","platform","campaign"]
+    for col in ["spend","impressions","clicks","conversions","revenue","CTR","CPC","CPA","CPM","ROAS","CPV","engagement_rate"]:
+        dfx[f"WoW_{col}"] = dfx.groupby(keys)[col].pct_change() * 100.0
+    return dfx
 
-    latest, prev = weeks[-1], weeks[-2]
-    curr_df = w[w["week"] == latest].set_index("entity")
-    prev_df = w[w["week"] == prev].set_index("entity")
+# ----------------------
+# Media Plan Join & Checks
+# ----------------------
+def load_media_plan(path: str) -> pd.DataFrame:
+    mp = pd.read_csv(path)
+    mp.columns = [c.strip().lower() for c in mp.columns]
+    for col in ["total_budget","duration_days","daily_cap","target_cpc","target_cpl","target_cpm","target_cpv"]:
+        if col in mp.columns:
+            mp[col] = pd.to_numeric(mp[col], errors="coerce")
+    return mp
 
-    rows = []
-    for ent in curr_df.index.unique():
-        if ent not in prev_df.index: 
-            continue
-        for kpi in ["spend", "conversions", "revenue", "cpa", "roas"]:
-            cv, pv = curr_df.loc[ent, kpi], prev_df.loc[ent, kpi]
-            if pd.isna(cv) or pd.isna(pv):
-                continue
-            d = wow_delta(float(cv), float(pv))
-            if d is None or abs(d) < 15:  # only meaningful moves
-                continue
-            prio = "High" if abs(d) >= 30 else "Medium"
-            rec = ("Scale +20% on winners; cap frequency."
-                   if (kpi == "roas" and d > 0) or (kpi == "cpa" and d < 0)
-                   else "Audit creatives/audiences/bids; trim budget on laggards.")
-            rows.append({
-                "date": today, "source": source_name, "scope": "Campaign", "entity": ent,
-                "kpi": kpi.upper(), "value": f"{float(cv):.4g}", "delta_wow": round(d, 1),
-                "insight": f"{kpi.upper()} changed {d:.1f}% WoW for '{ent}'.",
-                "recommendation": rec, "priority": prio, "confidence": 0.8
+def join_media_plan(df_week: pd.DataFrame, mp: pd.DataFrame) -> pd.DataFrame:
+    keys = ["client","brand","market","platform","campaign","objective"]
+    for k in keys:
+        if k not in df_week.columns: df_week[k] = np.nan
+        if k not in mp.columns: mp[k] = np.nan
+    return pd.merge(df_week, mp, on=keys, how="left", suffixes=("","_plan"))
+
+def expected_daily_spend(row):
+    if pd.isna(row.get("total_budget")) or pd.isna(row.get("duration_days")) or row["duration_days"] == 0:
+        return np.nan
+    return row["total_budget"] / row["duration_days"]
+
+def compute_plan_diagnostics(df_week_mp: pd.DataFrame) -> pd.DataFrame:
+    df = df_week_mp.copy()
+    df["expected_daily"] = df.apply(expected_daily_spend, axis=1)
+
+    def rate_check(r):
+        obj = str(r.get("objective","")).lower()
+        band = RATE_VARIANCE_BAND_PCT
+        flags = []
+        if obj.startswith("aware"):
+            if not pd.isna(r.get("target_cpm")) and not pd.isna(r.get("CPM")):
+                pct = _pct_change(r["CPM"], r["target_cpm"])
+                if abs(pct) >= band: flags.append(("CPM", r["CPM"], pct))
+        elif obj.startswith("video"):
+            if not pd.isna(r.get("target_cpv")) and not pd.isna(r.get("CPV")):
+                pct = _pct_change(r["CPV"], r["target_cpv"])
+                if abs(pct) >= band: flags.append(("CPV", r["CPV"], pct))
+        elif obj.startswith("consid"):
+            if not pd.isna(r.get("target_cpc")) and not pd.isna(r.get("CPC")):
+                pct = _pct_change(r["CPC"], r["target_cpc"])
+                if abs(pct) >= band: flags.append(("CPC", r["CPC"], pct))
+        elif obj.startswith("conv"):
+            if not pd.isna(r.get("target_cpl")) and not pd.isna(r.get("CPA")):
+                pct = _pct_change(r["CPA"], r["target_cpl"])
+                if abs(pct) >= band: flags.append(("CPA", r["CPA"], pct))
+        return flags
+
+    df["rate_flags"] = df.apply(rate_check, axis=1)
+
+    def spend_flag(r):
+        if pd.isna(r.get("expected_daily")) or pd.isna(r.get("spend")):
+            return np.nan
+        expected_week = r["expected_daily"] * 7.0
+        if expected_week == 0: return np.nan
+        return _pct_change(r["spend"], expected_week)
+
+    df["spend_vs_expected_week_pct"] = df.apply(spend_flag, axis=1)
+    return df
+
+# ----------------------
+# Rules → Insights
+# ----------------------
+def rules_to_insights(df_week_mp_diag: pd.DataFrame, obj_map: dict) -> pd.DataFrame:
+    insights = []
+    for _, r in df_week_mp_diag.iterrows():
+        scope = "campaign"
+        entity = str(r.get("campaign",""))
+        date_val = r.get("week", pd.Timestamp.today().date())
+        relevant = obj_map.get(str(r.get("objective","")), obj_map.get("Default", []))
+
+        # 1) WoW relevant KPIs
+        for k in relevant:
+            wow_col = f"WoW_{k}" if f"WoW_{k}" in r.index else None
+            if wow_col and not pd.isna(r[wow_col]) and abs(r[wow_col]) >= WEEK_OVER_WEEK_THRESHOLD_PCT:
+                insights.append({
+                    "date": date_val, "scope": scope, "entity_name": entity,
+                    "kpi": k, "value": r.get(k, np.nan), "delta_wow": r[wow_col],
+                    "insight": f"{k} moved {r[wow_col]:.1f}% WoW.",
+                    "recommendation": f"Investigate drivers of {k} change; adjust bids/creatives/audiences.",
+                    "priority": "High" if abs(r[wow_col]) >= (WEEK_OVER_WEEK_THRESHOLD_PCT*1.5) else "Medium",
+                    "confidence": 0.7
+                })
+
+        # 2) Rate vs target
+        for kpi, val, pct in r.get("rate_flags", []):
+            direction = "above" if pct > 0 else "below"
+            rec = {
+                "CPM": "Test broader placements/frequency caps; iterate creatives.",
+                "CPV": "Optimize video hook/length; tune placements; widen audience.",
+                "CPC": "Boost CTR via creatives; test LPs; refine audiences.",
+                "CPA": "Tighten retargeting; adjust bid strategy; test high-intent segments."
+            }.get(kpi, "Optimize against target.")
+            insights.append({
+                "date": date_val, "scope": scope, "entity_name": entity,
+                "kpi": kpi, "value": val, "delta_wow": np.nan,
+                "insight": f"{kpi} is {abs(pct):.1f}% {direction} the target.",
+                "recommendation": rec,
+                "priority": "High" if abs(pct) >= (RATE_VARIANCE_BAND_PCT*1.5) else "Medium",
+                "confidence": 0.75
             })
 
-    if not rows:
-        rows.append({
-            "date": today, "source": source_name, "scope": "Account", "entity": "ALL",
-            "kpi": "INFO", "value": "", "delta_wow": "",
-            "insight": "No notable WoW changes detected.",
-            "recommendation": "Maintain budgets; keep monitoring daily.",
-            "priority": "Low", "confidence": 0.9
-        })
-    return pd.DataFrame(rows)
+        # 3) Spend pacing
+        svsp = r.get("spend_vs_expected_week_pct", np.nan)
+        if not pd.isna(svsp) and abs(svsp) >= 10:
+            direction = "over" if svsp > 0 else "under"
+            insights.append({
+                "date": date_val, "scope": scope, "entity_name": entity,
+                "kpi": "spend_pacing", "value": r.get("spend", np.nan), "delta_wow": svsp,
+                "insight": f"Spend is {abs(svsp):.1f}% {direction} the expected weekly pace.",
+                "recommendation": "Reallocate budgets or adjust daily caps to align with plan.",
+                "priority": "Medium", "confidence": 0.7
+            })
 
-def upload_to_s3_and_get_url(local_path: str) -> str:
-    """Uploads file and returns a presigned HTTPS URL (valid ~3 days)."""
-    bucket = os.environ["S3_BUCKET"]
-    prefix = os.getenv("S3_PREFIX", "trase-insights/")
-    key = f"{prefix}{os.path.basename(local_path)}"
-    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"),
-                      config=Config(signature_version="s3v4"))
-    s3.upload_file(local_path, bucket, key, ExtraArgs={"ContentType": "text/csv"})
-    url = s3.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=60 * 60 * 24 * 3  # 3 days
-    )
-    return url
+    cols = ["date","scope","entity_name","kpi","value","delta_wow","insight","recommendation","priority","confidence"]
+    out = pd.DataFrame(insights, columns=cols) if insights else pd.DataFrame(columns=cols)
+    if not out.empty:
+        out = out.sort_values(["date","priority"], ascending=[False, True])
+    return out
 
-def ping_funnel_webhook(file_url: str):
-    endpoint = os.environ["FUNNEL_WEBHOOK_ENDPOINT"]
-    token = os.environ["FUNNEL_WEBHOOK_TOKEN"]
-    headers = {"Content-Type": "application/json", "x-funnel-fileimport-token": token}
-    payload = {"files": [{"url": file_url}]}
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-    print("Webhook:", r.status_code, r.text)
-    r.raise_for_status()
+# ----------------------
+# Webhook Push (Funnel)
+# ----------------------
+def push_to_funnel_webhook(df: pd.DataFrame) -> dict:
+    if not FUNNEL_WEBHOOK_URL:
+        return {"status": "skipped", "reason": "FUNNEL_WEBHOOK_URL not set"}
+    payload = {"token": FUNNEL_WEBHOOK_TOKEN or None, "rows": df.to_dict(orient="records")}
+    resp = requests.post(FUNNEL_WEBHOOK_URL, json=payload, timeout=60)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"text": resp.text}
+    return {"status_code": resp.status_code, "response": data}
 
-# ---------- Main ----------
+# ----------------------
+# Email Snapshot (optional)
+# ----------------------
+def send_email_snapshot(df_insights: pd.DataFrame, client_name: str = "Portfolio") -> None:
+    if not EMAIL_ENABLED or not EMAIL_TO or df_insights.empty:
+        return
+    top = df_insights.head(10).copy()
+    cols = ["date","entity_name","kpi","value","delta_wow","insight","recommendation","priority"]
+    top = top[cols]
+    html_table = top.to_html(index=False, justify="left", border=0)
+    msg = MIMEMultipart("alternative")
+    subject = EMAIL_SUBJECT_TEMPLATE.format(client=client_name)
+    msg["Subject"] = subject; msg["From"] = EMAIL_FROM; msg["To"] = EMAIL_TO
+    html = f"<html><body><h3>Top Insights</h3>{html_table}<p style='color:#888'>Generated by Trase Bot Analyzer</p></body></html>"
+    msg.attach(MIMEText(html, "html"))
+    with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as server:
+        server.starttls()
+        if EMAIL_SMTP_USER: server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASS)
+        server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+
+# ----------------------
+# Main
+# ----------------------
 def main():
-    # SHEETS_CSV_URLS can be JSON (preferred) or single URL string
-    raw = os.getenv("SHEETS_CSV_URLS", "[]").strip()
-    sources = []
-    if raw.startswith("["):
-        sources = json.loads(raw)  # e.g. [{"name":"Funnel data","url":"https://..."}]
-    elif raw:
-        sources = [{"name": "Funnel data", "url": raw}]
-    else:
-        raise RuntimeError("Set SHEETS_CSV_URLS env (JSON array or single CSV URL).")
+    print("→ Fetching Funnel CSV ...")
+    raw = fetch_funnel_csv(FUNNEL_EXPORT_URL)
+    print(f"Fetched rows: {len(raw)}")
 
-    all_frames = []
-    for s in sources:
-        name, url = s["name"], s["url"]
-        print(f"Fetching: {name} -> {url}")
-        try:
-            df = fetch_csv(url)
-            df = ensure_columns(df)
-            ins = build_insights(df, name)
-            all_frames.append(ins)
-        except Exception as e:
-            print(f"[WARN] {name}: {e}")
+    print("→ Normalizing & computing KPIs ...")
+    df = normalize_df(raw)
+    df = compute_universal_kpis(df)
 
-    if not all_frames:
-        print("No insights generated."); return
+    print("→ Weekly aggregate & WoW ...")
+    weekly = weekly_wow(df)
 
-    out = pd.concat(all_frames, ignore_index=True)
-    fname = f"trase_ai_insights_{int(time.time())}.csv"
-    out.to_csv(fname, index=False)
-    print(f"Saved {fname}\nTop rows:\n", out.head(10))
+    print("→ Load objective map + media plan ...")
+    obj_map = load_objective_map(OBJECTIVE_KPIS_PATH)
+    mp = load_media_plan(MEDIA_PLAN_PATH)
 
-    if USE_S3:
-        url = upload_to_s3_and_get_url(fname)
-        print("Uploaded to S3:", url)
-        ping_funnel_webhook(url)
-    else:
-        print("MODE=sheet_only (not posting to Funnel).")
+    print("→ Join media plan & compute diagnostics ...")
+    joined = join_media_plan(weekly, mp)
+    diag = compute_plan_diagnostics(joined)
+
+    print("→ Rules → insights ...")
+    insights = rules_to_insights(diag, obj_map)
+    print(f"Insights generated: {len(insights)}")
+
+    os.makedirs("out", exist_ok=True)
+    df.to_csv("out/daily_with_kpis.csv", index=False)
+    weekly.to_csv("out/weekly_agg.csv", index=False)
+    diag.to_csv("out/weekly_with_plan_diag.csv", index=False)
+    insights.to_csv("out/insights.csv", index=False)
+
+    print("→ Push to Funnel webhook ...")
+    wh = push_to_funnel_webhook(insights)
+    print("Webhook result:", wh)
+
+    try:
+        send_email_snapshot(insights, client_name="Portfolio")
+        print("Email snapshot: done or skipped.")
+    except Exception as e:
+        print("Email snapshot error:", e)
+
+    print("✓ Done.")
 
 if __name__ == "__main__":
     main()
